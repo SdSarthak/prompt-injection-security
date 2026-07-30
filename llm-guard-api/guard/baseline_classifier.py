@@ -68,20 +68,28 @@ class TrainingReport:
         )
 
 
-def _build_pipeline():
+def _build_pipeline(n_samples: int = 0):
     """Build the TF-IDF + logistic regression pipeline.
 
     Word n-grams catch phrasing ("ignore all previous instructions"); character
     n-grams catch obfuscation and leetspeak that word tokenisation destroys.
+
+    Args:
+        n_samples: Size of the training corpus. Small corpora (tests, quick
+            experiments) need ``min_df=1``, otherwise pruning removes every
+            term and fitting raises.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline, FeatureUnion
 
+    word_min_df = 2 if n_samples >= 200 else 1
+    char_min_df = 3 if n_samples >= 200 else 1
+
     word_vec = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
-        min_df=2,
+        min_df=word_min_df,
         max_features=60000,
         sublinear_tf=True,
         lowercase=True,
@@ -90,7 +98,7 @@ def _build_pipeline():
     char_vec = TfidfVectorizer(
         analyzer="char_wb",
         ngram_range=(3, 5),
-        min_df=3,
+        min_df=char_min_df,
         max_features=60000,
         sublinear_tf=True,
         lowercase=True,
@@ -218,7 +226,7 @@ class BaselineIntentClassifier:
             texts, binary, test_size=test_size, stratify=binary, random_state=random_state
         )
 
-        pipeline = _build_pipeline()
+        pipeline = _build_pipeline(n_samples=len(x_train))
         pipeline.fit(x_train, y_train)
 
         y_pred = pipeline.predict(x_test)
