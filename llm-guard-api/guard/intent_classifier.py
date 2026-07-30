@@ -1,30 +1,34 @@
-"""Transformer-based intent classifier for detecting prompt injection attempts."""
+"""Transformer-based intent classifier for detecting prompt injection attempts.
 
-import os
+Importing this module requires torch and transformers. Use
+``guard.build_classifier()`` if you want automatic fallback to the CPU-only
+baseline backend when those are unavailable or no checkpoint has been trained.
+"""
+
 import json
-from typing import List, Tuple, Dict, Optional
-from dataclasses import dataclass
-import numpy as np
+import logging
+import os
+from typing import List, Dict, Optional
 
+import numpy as np
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AdamW,
     get_linear_schedule_with_warmup,
 )
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 import config
+from .results import ClassificationResult
 
+logger = logging.getLogger(__name__)
 
-@dataclass
-class ClassificationResult:
-    """Result of intent classification."""
-    intent: str  # "benign", "suspicious", "malicious"
-    confidence: float  # 0.0 to 1.0
-    class_scores: Dict[str, float]  # Scores for each class
+BACKEND_NAME = "transformer"
+PRETRAINED_MODEL_NAME = os.getenv("PRETRAINED_MODEL_NAME", "microsoft/deberta-v3-small")
+
+__all__ = ["IntentClassifier", "PromptDataset", "ClassificationResult"]
 
 
 class PromptDataset(Dataset):
@@ -85,41 +89,42 @@ class IntentClassifier:
         if model_path is None:
             model_path = config.get_trained_model_path()
         
-        # Load tokenizer from model directory
-        tokenizer_path = model_path
-        
-        # Load model
-        model_exists = model_path and os.path.exists(model_path)
-        has_weights = model_exists and os.path.exists(os.path.join(model_path, "pytorch_model.bin"))
-        
-        if model_exists and has_weights:
-            print(f"✓ Loading fine-tuned model from {model_path}")
+        self.model_path = model_path
+        self.is_fine_tuned = False
+
+        # `config.has_transformer_weights` accepts either pytorch_model.bin or
+        # model.safetensors, which is what recent transformers versions write.
+        if config.has_transformer_weights(model_path):
+            logger.info("Loading fine-tuned model from %s", model_path)
             try:
-                from transformers import AutoTokenizer, AutoModelForSequenceClassification
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
                 self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
-                print(f"✓ Model and tokenizer loaded successfully")
-            except Exception as e:
-                print(f"⚠ Failed to load model: {e}. Falling back to pre-trained.")
+                self.is_fine_tuned = True
+                logger.info("Model and tokenizer loaded successfully")
+            except Exception as exc:
+                logger.warning("Failed to load %s (%s); falling back to pre-trained", model_path, exc)
                 self._load_pretrained()
         else:
-            print(f"⚠ Fine-tuned model not found at {model_path}")
-            print(f"  Using pre-trained DeBERTa (train with notebook for better results)")
+            logger.warning(
+                "No fine-tuned checkpoint at %s. Falling back to pre-trained %s, whose "
+                "classification head is randomly initialised - predictions are NOT meaningful "
+                "until you run `python train.py --backend transformer`.",
+                model_path,
+                PRETRAINED_MODEL_NAME,
+            )
             self._load_pretrained()
-        
+
         self.model.to(self.device)
         self.model.eval()
-    
+
     def _load_pretrained(self):
-        """Load pre-trained DeBERTa model."""
-        print("Loading pre-trained DeBERTa v3 small...")
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        
-        model_name = "microsoft/deberta-v3-small"
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        """Load the pre-trained backbone with a fresh classification head."""
+        logger.info("Loading pre-trained %s", PRETRAINED_MODEL_NAME)
+        self.tokenizer = AutoTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            model_name, num_labels=3
+            PRETRAINED_MODEL_NAME, num_labels=len(config.INTENT_CLASSES)
         )
+        self.is_fine_tuned = False
 
     def classify(self, prompt: str) -> ClassificationResult:
         """
@@ -131,48 +136,54 @@ class IntentClassifier:
         Returns:
             ClassificationResult with intent, confidence, and class scores
         """
-        inputs = self.tokenizer(
-            prompt,
-            max_length=128,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
+        return self.batch_classify([prompt])[0]
 
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            probabilities = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-        # Get top prediction
-        predicted_id = np.argmax(probabilities)
-        predicted_intent = self.id_to_intent[predicted_id]
-        confidence = float(probabilities[predicted_id])
-
-        # Create class scores dict
-        class_scores = {
-            self.id_to_intent[i]: float(probabilities[i]) for i in range(len(probabilities))
-        }
-
-        return ClassificationResult(
-            intent=predicted_intent, confidence=confidence, class_scores=class_scores
-        )
-
-    def batch_classify(self, prompts: List[str]) -> List[ClassificationResult]:
+    def batch_classify(self, prompts: List[str], batch_size: int = 32) -> List[ClassificationResult]:
         """
-        Classify multiple prompts at once.
-        
+        Classify multiple prompts in batched forward passes.
+
         Args:
             prompts: List of prompts to classify
-            
+            batch_size: Number of prompts per forward pass
+
         Returns:
-            List of ClassificationResult objects
+            List of ClassificationResult objects, aligned with `prompts`
         """
-        results = []
-        for prompt in prompts:
-            results.append(self.classify(prompt))
+        cleaned = [("" if p is None else str(p)) for p in prompts]
+        if not cleaned:
+            return []
+
+        results: List[ClassificationResult] = []
+
+        for start in range(0, len(cleaned), batch_size):
+            chunk = cleaned[start : start + batch_size]
+            inputs = self.tokenizer(
+                chunk,
+                max_length=128,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                logits = self.model(**inputs).logits
+                probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+
+            for row in probabilities:
+                # `id_to_intent` is keyed by Python ints, so cast off numpy's int64.
+                predicted_id = int(np.argmax(row))
+                results.append(
+                    ClassificationResult(
+                        intent=self.id_to_intent[predicted_id],
+                        confidence=float(row[predicted_id]),
+                        class_scores={
+                            self.id_to_intent[i]: float(row[i]) for i in range(len(row))
+                        },
+                        backend=BACKEND_NAME,
+                    )
+                )
+
         return results
 
     def train(
@@ -184,7 +195,7 @@ class IntentClassifier:
         epochs: int = 3,
         batch_size: int = 16,
         learning_rate: float = 2e-5,
-        output_dir: str = None,
+        output_dir: Optional[str] = None,
     ) -> Dict:
         """
         Fine-tune the model on labeled prompt data.
@@ -202,6 +213,14 @@ class IntentClassifier:
         Returns:
             Dictionary with training metrics
         """
+        from sklearn.metrics import f1_score
+
+        unknown = {label for label in list(train_labels) + list(val_labels)} - set(self.intent_to_id)
+        if unknown:
+            raise ValueError(
+                f"Unknown intent label(s) {sorted(unknown)}; expected one of {config.INTENT_CLASSES}"
+            )
+
         # Convert labels to ids
         train_label_ids = [self.intent_to_id[label] for label in train_labels]
         val_label_ids = [self.intent_to_id[label] for label in val_labels]
@@ -267,8 +286,8 @@ class IntentClassifier:
                     val_preds.extend(preds.cpu().numpy())
                     val_true.extend(labels.cpu().numpy())
 
-            accuracy = (np.array(val_preds) == np.array(val_true)).mean()
-            f1 = f1_score(val_true, val_preds, average="weighted", zero_division=0)
+            accuracy = float((np.array(val_preds) == np.array(val_true)).mean())
+            f1 = float(f1_score(val_true, val_preds, average="weighted", zero_division=0))
 
             metrics["val_accuracy"].append(accuracy)
             metrics["val_f1"].append(f1)
@@ -277,11 +296,17 @@ class IntentClassifier:
 
             self.model.train()
 
+        self.model.eval()
+
         # Save model if output dir specified
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
             self.model.save_pretrained(output_dir)
             self.tokenizer.save_pretrained(output_dir)
-            print(f"\nModel saved to {output_dir}")
+            with open(os.path.join(output_dir, "training_metrics.json"), "w", encoding="utf-8") as handle:
+                json.dump(metrics, handle, indent=2)
+            self.is_fine_tuned = True
+            self.model_path = output_dir
+            logger.info("Model saved to %s", output_dir)
 
         return metrics

@@ -2,56 +2,90 @@
 
 import re
 from typing import Dict, List
-from dataclasses import dataclass
 
+from .results import RegexResult
 
-@dataclass
-class RegexResult:
-    """Result of regex pattern matching."""
-    flag: bool
-    matched_patterns: List[str]
-    score: float  # 0.0 to 1.0
+__all__ = ["RegexFilter", "RegexResult"]
 
 
 class RegexFilter:
     """Fast first-pass filter using regex patterns to catch obvious attacks."""
 
+    # Filler allowed between the verb and its object, e.g.
+    # "ignore ALL OF THE PREVIOUS instructions". Bounded and sentence-local so
+    # the pattern cannot span unrelated clauses or backtrack pathologically.
+    _GAP = r"[^.!?\n]{0,40}?"
+
+    # Words that mark the thing being overridden.
+    _TARGET = (
+        r"(?:instructions?|prompts?|rules?|directions?|directives?|commands?|"
+        r"guidelines?|constraints?|restrictions?|protocols?|safeguards?|"
+        r"context|conversation|programming|training)"
+    )
+    _SCOPE = r"(?:previous|prior|above|preceding|earlier|initial|original|system|all|any|your|the)"
+
     # High-severity patterns: instruction override attempts
     INSTRUCTION_OVERRIDE_PATTERNS = [
-        r"\bignore\s+(all|previous|prior|above)\s+instructions\b",
-        r"\bforget\s+(all|previous|prior|above)\s+(.*?)\b",
-        r"\bdisregard\s+(all|previous|prior)\s+instructions\b",
-        r"\boverride\s+system\s+prompt\b",
-        r"\bbypass\s+(all\s+)?restrictions\b",
-        r"\bdisable\s+(safety|content|filter)",
+        # "ignore all previous instructions", "disregard your earlier rules", ...
+        rf"\b(?:ignore|disregard|forget|discard|overlook|erase|delete)\b{_GAP}\b{_SCOPE}\b{_GAP}\b{_TARGET}\b",
+        # "forget everything above", "forget everything you were told"
+        r"\bforget\s+(?:everything|all)\b[^.!?\n]{0,40}",
+        rf"\boverride\s+(?:the\s+|your\s+|all\s+|any\s+)*(?:\w+\s+){{0,2}}{_TARGET}\b",
+        r"\bbypass\s+(?:all\s+|any\s+|the\s+|your\s+)*(?:restrictions?|filters?|rules?|guardrails?|safety|security|safeguards?)\b",
+        r"\bdisable\s+(?:all\s+|the\s+|your\s+)*(?:safety|content|filter|filters|moderation|guardrails?|restrictions?|safeguards?)\b",
+        # Classic injection headers used to smuggle a second instruction block.
+        r"^\s*(?:new|updated|revised|real|actual)\s+(?:instructions?|prompt|task)\s*[:\-]",
+        r"\b(?:new|updated|revised)\s+(?:instructions?|system\s+prompt)\s*[:\-]",
+        r"\bend\s+of\s+(?:prompt|instructions?|context)\b",
+        r"###\s*(?:instruction|system|end)\b",
     ]
 
-    # High-severity patterns: role hijacking
+    # High-severity patterns: identity override / unrestricted personas
     ROLE_HIJACKING_PATTERNS = [
-        r"\byou\s+are\s+(chatgpt|gpt-4|claude|llama|gemini|an\s+ai|a\s+jailbreak)",
-        r"\bpretend\s+(you\s+are|to\s+be)\s+",
-        r"\bact\s+as\s+",
-        r"\byou\s+will\s+(act|roleplay|behave)\s+as\b",
-        r"\bassume\s+(the\s+)?role\s+of\b",
+        r"\byou\s+are\s+(?:now\s+)?(?:chatgpt|gpt-?[0-9]|claude|llama|gemini|bard|dan)\b",
+        r"\byou\s+are\s+(?:now\s+)?an?\s+(?:unrestricted|unfiltered|uncensored|amoral|unethical|jailbroken|evil)\b",
+        r"\bno\s+(?:longer\s+)?(?:bound|restricted|limited|constrained)\s+by\b",
+        r"\b(?:without|with\s+no|free\s+from)\s+(?:any\s+)?(?:restrictions?|limitations?|filters?|rules?|ethical\s+guidelines?|safety\s+guidelines?)\b",
+        r"\byou\s+have\s+no\s+(?:restrictions?|limits?|filters?|rules?|guidelines?|ethics)\b",
+        r"\bdo\s+anything\s+now\b",
+    ]
+
+    # Medium-severity patterns: generic role-play framing.
+    # Deliberately softer than ROLE_HIJACKING: "act as a translator" is a normal
+    # request, so this only nudges the risk score instead of dominating it.
+    ROLE_PLAY_PATTERNS = [
+        r"\bpretend\s+(?:that\s+)?(?:you(?:'re|\s+are)|to\s+be)\b",
+        r"\bact\s+as\s+(?:an?|the)?\s*\w+",
+        r"\byou\s+will\s+(?:act|roleplay|role-play|behave|respond)\s+as\b",
+        r"\bassume\s+(?:the\s+)?(?:role|persona|identity)\s+of\b",
+        r"\brespond\s+only\s+as\b",
+        r"\bsimulate\s+(?:being\s+)?an?\s+\w+",
     ]
 
     # Medium-severity patterns: system prompt disclosure
     PROMPT_DISCLOSURE_PATTERNS = [
-        r"\b(system|initial)\s+prompt\b",
-        r"\bwhat\s+(are|is|was)\s+your\s+(system\s+)?prompt",
-        r"\bshow\s+(me\s+)?(the\s+)?(system\s+)?prompt",
-        r"\breveal\s+.*?prompt\b",
-        r"\breturn\s+the\s+(original\s+)?system\s+prompt\b",
+        r"\b(?:system|initial|original|hidden|secret)\s+prompt\b",
+        r"\bwhat\s+(?:are|is|was|were)\s+your\s+(?:system\s+|initial\s+|original\s+)?(?:prompt|instructions?|rules?|guidelines?)\b",
+        r"\b(?:show|print|output|display|repeat|reveal|list|tell)\s+(?:me\s+)?(?:the\s+|your\s+|all\s+)*(?:system\s+|initial\s+|original\s+|hidden\s+)?(?:prompt|instructions?|directives?)\b",
+        r"\brepeat\s+(?:the\s+|everything\s+)?(?:words?\s+)?above\b",
+        r"\breturn\s+the\s+(?:original\s+)?system\s+prompt\b",
+        r"\bwhat\s+were\s+you\s+told\b",
+        # "tell me your underlying/hidden/internal instructions"
+        r"\byour\s+(?:underlying|internal|hidden|secret|original|initial|base)\s+"
+        r"(?:instructions?|prompts?|rules?|guidelines?|directives?|configuration)\b",
+        r"\byour\s+training\s+data\b",
     ]
 
     # Medium-severity patterns: policy bypass
     POLICY_BYPASS_PATTERNS = [
-        r"\bjailbreak\b",
+        r"\bjailbreak\b|\bjailbroken\b",
         r"\bdeveloper\s+mode\b",
         r"\bgod\s+mode\b",
-        r"\bunrestricted\s+mode\b",
-        r"\bremove\s+all\s+restrictions\b",
-        r"\bmemories?\s+(disabled|removed|cleared)\b",
+        r"\b(?:unrestricted|unfiltered|uncensored|debug|admin|sudo)\s+mode\b",
+        r"\bremove\s+(?:all\s+)?(?:restrictions?|filters?|limits?|guardrails?)\b",
+        r"\bmemories?\s+(?:disabled|removed|cleared)\b",
+        r"\bhypothetically\s*,?\s+if\s+you\s+(?:had|could|were)\b",
+        r"\bfor\s+(?:educational|research)\s+purposes\s+only\b",
     ]
 
     # Medium-severity patterns: dangerous code patterns
@@ -71,82 +105,61 @@ class RegexFilter:
         r"\b(backdoor|trojan|malware)\b",
     ]
 
+    # Category -> (source patterns attribute, label used in output, severity)
+    CATEGORIES = (
+        ("high_override", "INSTRUCTION_OVERRIDE_PATTERNS", "instruction_override", 1.0),
+        ("high_role", "ROLE_HIJACKING_PATTERNS", "role_hijacking", 1.0),
+        ("medium_code", "DANGEROUS_CODE_PATTERNS", "dangerous_code", 0.8),
+        ("medium_disclosure", "PROMPT_DISCLOSURE_PATTERNS", "prompt_disclosure", 0.7),
+        ("medium_bypass", "POLICY_BYPASS_PATTERNS", "policy_bypass", 0.7),
+        ("medium_roleplay", "ROLE_PLAY_PATTERNS", "role_play", 0.5),
+        ("low_keywords", "SUSPICIOUS_KEYWORDS", "suspicious_keyword", 0.3),
+    )
+
     def __init__(self):
         """Initialize compiled regex patterns with flags."""
         self.patterns = self._compile_patterns()
 
     def _compile_patterns(self) -> Dict[str, List[re.Pattern]]:
         """Compile all regex patterns with appropriate flags."""
-        patterns = {
-            "high_override": [re.compile(p, re.IGNORECASE) for p in self.INSTRUCTION_OVERRIDE_PATTERNS],
-            "high_role": [re.compile(p, re.IGNORECASE) for p in self.ROLE_HIJACKING_PATTERNS],
-            "medium_disclosure": [re.compile(p, re.IGNORECASE) for p in self.PROMPT_DISCLOSURE_PATTERNS],
-            "medium_bypass": [re.compile(p, re.IGNORECASE) for p in self.POLICY_BYPASS_PATTERNS],
-            "medium_code": [re.compile(p, re.IGNORECASE) for p in self.DANGEROUS_CODE_PATTERNS],
-            "low_keywords": [re.compile(p, re.IGNORECASE) for p in self.SUSPICIOUS_KEYWORDS],
+        return {
+            key: [re.compile(p, re.IGNORECASE) for p in getattr(self, attr)]
+            for key, attr, _label, _severity in self.CATEGORIES
         }
-        return patterns
 
     def check(self, prompt: str) -> RegexResult:
         """
         Check prompt against regex patterns.
-        
+
         Args:
             prompt: User input prompt to check
-            
+
         Returns:
-            RegexResult with flag, matched patterns, and risk score
+            RegexResult with flag, matched patterns, and risk score.
+            The risk score is the highest severity among all matches, so a
+            single high-severity hit is never diluted by low-severity noise.
         """
-        matched_patterns = []
-        severity_scores = []
+        if not prompt:
+            return RegexResult(flag=False, matched_patterns=[], score=0.0)
 
-        # Check high-severity patterns (instruction override)
-        for pattern in self.patterns["high_override"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"instruction_override: {match}")
-                severity_scores.append(1.0)
+        matched_patterns: List[str] = []
+        seen = set()
+        risk_score = 0.0
 
-        # Check high-severity patterns (role hijacking)
-        for pattern in self.patterns["high_role"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"role_hijacking: {match}")
-                severity_scores.append(1.0)
-
-        # Check medium-severity patterns (prompt disclosure)
-        for pattern in self.patterns["medium_disclosure"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"prompt_disclosure: {match}")
-                severity_scores.append(0.7)
-
-        # Check medium-severity patterns (policy bypass)
-        for pattern in self.patterns["medium_bypass"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"policy_bypass: {match}")
-                severity_scores.append(0.7)
-
-        # Check medium-severity patterns (dangerous code)
-        for pattern in self.patterns["medium_code"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"dangerous_code: {match}")
-                severity_scores.append(0.8)
-
-        # Check low-severity patterns
-        for pattern in self.patterns["low_keywords"]:
-            if pattern.search(prompt):
-                match = pattern.search(prompt).group(0)
-                matched_patterns.append(f"suspicious_keyword: {match}")
-                severity_scores.append(0.3)
-
-        # Calculate overall risk score (max of all severities)
-        risk_score = max(severity_scores) if severity_scores else 0.0
+        for key, _attr, label, severity in self.CATEGORIES:
+            for pattern in self.patterns[key]:
+                match = pattern.search(prompt)
+                if match:
+                    # Overlapping patterns in the same category often capture the
+                    # same span; report each distinct hit once.
+                    entry = f"{label}: {match.group(0).strip()}"
+                    if entry not in seen:
+                        seen.add(entry)
+                        matched_patterns.append(entry)
+                    risk_score = max(risk_score, severity)
 
         return RegexResult(
             flag=len(matched_patterns) > 0,
             matched_patterns=matched_patterns,
-            score=risk_score
+            score=risk_score,
         )

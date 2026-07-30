@@ -1,8 +1,10 @@
 """Prompt sanitization layer for neutralizing injection risks while preserving UX."""
 
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 from enum import Enum
+
+import config
 
 
 class SanitizationLevel(Enum):
@@ -43,14 +45,34 @@ class PromptSanitizer:
         r"\|\|\|+",
     ]
 
-    def __init__(self, level: SanitizationLevel = SanitizationLevel.MEDIUM):
+    @classmethod
+    def from_name(cls, name: str, **kwargs) -> "PromptSanitizer":
+        """Build a sanitizer from a level name such as "medium".
+
+        Unknown names fall back to MEDIUM rather than raising, so a typo in the
+        environment degrades to the balanced default instead of killing startup.
+        """
+        try:
+            level = SanitizationLevel(str(name).strip().lower())
+        except ValueError:
+            level = SanitizationLevel.MEDIUM
+        return cls(level=level, **kwargs)
+
+    def __init__(
+        self,
+        level: SanitizationLevel = SanitizationLevel.MEDIUM,
+        max_length: Optional[int] = None,
+    ):
         """
         Initialize sanitizer with aggressiveness level.
-        
+
         Args:
             level: Sanitization level (LOW, MEDIUM, HIGH)
+            max_length: Hard cap on sanitized prompt length.
+                Defaults to ``config.MAX_PROMPT_LENGTH``.
         """
         self.level = level
+        self.max_length = int(max_length if max_length is not None else config.MAX_PROMPT_LENGTH)
         self.meta_patterns = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in self.META_INSTRUCTIONS]
         self.role_patterns = [re.compile(p, re.IGNORECASE) for p in self.ROLE_PHRASES]
         self.separator_patterns = [re.compile(p) for p in self.SEPARATORS]
@@ -65,49 +87,52 @@ class PromptSanitizer:
         Returns:
             Tuple of (sanitized_prompt, summary_of_changes)
         """
-        original = prompt
-        sanitized = prompt
+        original = prompt or ""
+        sanitized = original
+        changes = []
 
         # Remove meta-instructions
-        for pattern in self.meta_patterns:
-            matches = pattern.findall(sanitized)
-            if matches and self.level != SanitizationLevel.LOW:
-                sanitized = pattern.sub("", sanitized)
+        if self.level != SanitizationLevel.LOW:
+            removed_meta = False
+            for pattern in self.meta_patterns:
+                sanitized, count = pattern.subn("", sanitized)
+                removed_meta = removed_meta or count > 0
+            if removed_meta:
+                changes.append("Removed meta-instructions")
 
         # Remove role-playing phrases (aggressive in HIGH mode)
         if self.level == SanitizationLevel.HIGH:
+            removed_roles = False
             for pattern in self.role_patterns:
-                sanitized = pattern.sub("", sanitized)
+                sanitized, count = pattern.subn("", sanitized)
+                removed_roles = removed_roles or count > 0
+            if removed_roles:
+                changes.append("Removed role-playing directives")
 
-        # Normalize multiple spaces
-        sanitized = re.sub(r"\s+", " ", sanitized).strip()
-
-        # Handle section separators (medium/high only)
-        if self.level in [SanitizationLevel.MEDIUM, SanitizationLevel.HIGH]:
+        # Handle section separators (medium/high only). A prompt that opens with
+        # a separator would otherwise be reduced to an empty string, so keep the
+        # first non-empty section rather than blindly taking parts[0].
+        if self.level in (SanitizationLevel.MEDIUM, SanitizationLevel.HIGH):
             for pattern in self.separator_patterns:
                 if pattern.search(sanitized):
-                    # Keep only the first section
-                    parts = pattern.split(sanitized)
-                    sanitized = parts[0].strip()
+                    parts = [part.strip() for part in pattern.split(sanitized)]
+                    first_section = next((part for part in parts if part), "")
+                    if first_section != sanitized.strip():
+                        sanitized = first_section
+                        changes.append("Dropped content after a section separator")
+                    break
+
+        # Normalize whitespace
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
 
         # Truncate if needed
-        max_length = 2000
-        if len(sanitized) > max_length:
-            sanitized = sanitized[:max_length] + "..."
+        if self.max_length > 0 and len(sanitized) > self.max_length:
+            sanitized = sanitized[: self.max_length].rstrip() + "..."
+            changes.append(f"Truncated to {self.max_length} characters")
 
-        # Generate summary of changes
-        changes = []
-        if sanitized != original:
-            length_reduction = len(original) - len(sanitized)
-            changes.append(f"Removed {length_reduction} characters")
-            
-            if any(pattern.search(original) for pattern in self.meta_patterns):
-                changes.append("Removed meta-instructions")
-            
-            if self.level == SanitizationLevel.HIGH and any(
-                pattern.search(original) for pattern in self.role_patterns
-            ):
-                changes.append("Removed role-playing directives")
+        removed = len(original) - len(sanitized)
+        if removed > 0:
+            changes.append(f"Removed {removed} characters")
 
         summary = "; ".join(changes) if changes else "No changes"
         return sanitized, summary
