@@ -1,0 +1,49 @@
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Trained model artifacts (rebuild with `python train.py`)
+guard/models/*
+!guard/models/.gitkeep
+
+# Datasets — the bundled training set is committed, everything else is not
+data/*.csv
+!data/prompts.csv
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log

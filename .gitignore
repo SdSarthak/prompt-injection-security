@@ -1,0 +1,74 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+serviceAccount*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Node
+node_modules/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Model artifacts and checkpoints
+*.h5
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+llm-guard-api/guard/models/*
+!llm-guard-api/guard/models/.gitkeep
+
+# Datasets (the bundled training set is committed explicitly below)
+*.sqlite3
+*.parquet
+*.jsonl
+llm-guard-api/data/*.csv
+!llm-guard-api/data/prompts.csv
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
