@@ -1,0 +1,8 @@
+# Test tooling.
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest
+
+-r requirements.txt
+
+pytest>=7.4,<9
+httpx>=0.27  # required by fastapi.testclient

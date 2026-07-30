@@ -1,0 +1,15 @@
+# Optional: the DeBERTa transformer backend and dataset downloads.
+#   pip install -r requirements.txt -r requirements-transformer.txt
+#
+# Only needed for `python train.py --backend transformer` or
+# CLASSIFIER_BACKEND=transformer. The baseline backend runs without any of this.
+
+-r requirements.txt
+
+torch>=2.1
+transformers>=4.37,<5
+datasets>=2.14
+
+# DeBERTa-v3 ships a sentencepiece tokenizer; both are required to load it.
+sentencepiece>=0.1.99
+protobuf>=3.20

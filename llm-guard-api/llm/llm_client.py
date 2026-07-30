@@ -1,12 +1,18 @@
 """Gemini API client for LLM integration with error handling and safety settings."""
 
-import os
+import logging
 import time
 from typing import Optional
+
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 import config
+
+logger = logging.getLogger(__name__)
+
+# Failures that will never succeed on retry - retrying just wastes wall clock.
+_NON_RETRYABLE = ("api key", "permission", "unauthenticated", "invalid argument", "not found")
 
 
 class GeminiClient:
@@ -21,7 +27,10 @@ class GeminiClient:
         """
         self.api_key = api_key or config.GEMINI_API_KEY
         if not self.api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment or config")
+            raise ValueError(
+                "GEMINI_API_KEY not found. Copy .env.example to .env and set your key, "
+                "or export GEMINI_API_KEY."
+            )
 
         genai.configure(api_key=self.api_key)
         self.model_name = config.GEMINI_MODEL
@@ -70,22 +79,49 @@ class GeminiClient:
                     safety_settings=safety_settings,
                 )
 
-                # Check for safety filtering
-                if response.prompt_feedback.block_reason:
-                    return (
-                        "[BLOCKED] Response blocked by Gemini safety filter: "
-                        f"{response.prompt_feedback.block_reason}"
-                    )
+                return self._extract_text(response)
 
-                return response.text
-
-            except Exception as e:
+            except Exception as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in _NON_RETRYABLE):
+                    raise
                 if attempt < max_retries - 1:
                     wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
-                    print(f"API call failed (attempt {attempt + 1}). Retrying in {wait_time}s: {e}")
+                    logger.warning(
+                        "Gemini call failed (attempt %d/%d), retrying in %.1fs: %s",
+                        attempt + 1,
+                        max_retries,
+                        wait_time,
+                        exc,
+                    )
                     time.sleep(wait_time)
                 else:
-                    raise Exception(f"API call failed after {max_retries} attempts: {e}")
+                    raise RuntimeError(f"API call failed after {max_retries} attempts: {exc}") from exc
+
+        raise RuntimeError("API call failed: retry loop exhausted")
+
+    @staticmethod
+    def _extract_text(response) -> str:
+        """Pull the text out of a response, tolerating filtered/empty candidates.
+
+        `response.text` raises when the model returns no usable candidate (a
+        safety block, a recitation stop, or an empty completion), so those cases
+        are converted into an explicit marker string instead of an exception.
+        """
+        feedback = getattr(response, "prompt_feedback", None)
+        block_reason = getattr(feedback, "block_reason", None)
+        if block_reason:
+            return f"[BLOCKED] Prompt blocked by the Gemini safety filter: {block_reason}"
+
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return "[EMPTY] Gemini returned no candidates"
+
+        try:
+            return response.text
+        except Exception:
+            finish_reason = getattr(candidates[0], "finish_reason", "unknown")
+            return f"[BLOCKED] Gemini returned no usable text (finish_reason={finish_reason})"
 
     def stream(
         self,
@@ -123,8 +159,13 @@ class GeminiClient:
         )
 
         for chunk in response:
-            if chunk.text:
-                yield chunk.text
+            # A filtered chunk raises on `.text` rather than returning empty.
+            try:
+                text = chunk.text
+            except Exception:
+                continue
+            if text:
+                yield text
 
     def _get_safety_settings(self):
         """
