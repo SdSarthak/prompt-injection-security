@@ -1,6 +1,5 @@
 """Tests for the prompt sanitizer."""
 
-import pytest
 
 from guard import PromptSanitizer, SanitizationLevel
 
