@@ -293,7 +293,34 @@ tests/test_guard.py                end-to-end verdicts, evaluation metrics, trun
 tests/test_api.py                  every route, auth, validation, response contract
 ```
 
-## Evaluating
+## Measured performance
+
+End-to-end pipeline decisions on 1,625 held-out prompts — the same stratified
+20% split (seed 42) the classifier was scored on, so none of these rows were
+trained on. Reproduce with `python evaluate.py`:
+
+| Metric | Value |
+|---|---|
+| Overall accuracy | **0.9760** |
+| Attack recall (blocked or sanitized) | **0.9754** |
+| Benign specificity (allowed untouched) | **0.9763** |
+| Precision | 0.9463 |
+| F1 | 0.9606 |
+| False negatives (attacks allowed through) | 12 / 488 |
+| False positives (benign prompts held up) | 27 / 1137 |
+| Mean latency | **2.4 ms/prompt** (CPU, single process) |
+
+These are pipeline numbers, not classifier numbers: regex false positives and
+decision-engine thresholds are included. The classifier alone scores 0.9932
+accuracy and 0.9998 ROC-AUC on the same split.
+
+```bash
+python evaluate.py                      # full held-out set
+python evaluate.py --limit 500 --json   # machine-readable
+python evaluate.py --backend transformer
+```
+
+You can also score your own labelled set through the library:
 
 ```python
 from app import LLMGuard
@@ -344,6 +371,7 @@ llm-guard-api/
   app.py                       LLMGuard orchestrator + CLI
   config.py                    environment-driven configuration
   train.py                     dataset download and training, both backends
+  evaluate.py                  held-out evaluation of the whole pipeline
   setup_model.py               model status / verification utility
   quickstart.py                environment check
   train_classifier.ipynb       Colab GPU fine-tuning notebook
