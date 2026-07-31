@@ -3,6 +3,7 @@
 import re
 from typing import Dict, List
 
+from .normalize import detect_obfuscation, matching_forms
 from .results import RegexResult
 
 __all__ = ["RegexFilter", "RegexResult"]
@@ -105,6 +106,16 @@ class RegexFilter:
         r"\b(backdoor|trojan|malware)\b",
     ]
 
+    # Evasion techniques that are, on their own, evidence of intent. A user does
+    # not insert a zero-width joiner mid-word or mix Cyrillic into an English
+    # word by accident, so these carry a score even with no pattern hit.
+    # Letter spacing and single-script look-alikes are reported but not scored:
+    # "S P A C E D" text and non-Latin prose are both legitimate.
+    OBFUSCATION_SEVERITY = {
+        "invisible_characters": 0.7,
+        "mixed_script_word": 0.7,
+    }
+
     # Category -> (source patterns attribute, label used in output, severity)
     CATEGORIES = (
         ("high_override", "INSTRUCTION_OVERRIDE_PATTERNS", "instruction_override", 1.0),
@@ -131,6 +142,11 @@ class RegexFilter:
         """
         Check prompt against regex patterns.
 
+        The patterns are matched against normalised, de-obfuscated views of the
+        prompt rather than the raw bytes: a zero-width space or a Cyrillic "о"
+        inside "ignore" would otherwise silence every high-severity rule while
+        leaving the attack perfectly legible to the model.
+
         Args:
             prompt: User input prompt to check
 
@@ -146,10 +162,14 @@ class RegexFilter:
         seen = set()
         risk_score = 0.0
 
+        forms = matching_forms(prompt)
+
         for key, _attr, label, severity in self.CATEGORIES:
             for pattern in self.patterns[key]:
-                match = pattern.search(prompt)
-                if match:
+                for form in forms:
+                    match = pattern.search(form)
+                    if not match:
+                        continue
                     # Overlapping patterns in the same category often capture the
                     # same span; report each distinct hit once.
                     entry = f"{label}: {match.group(0).strip()}"
@@ -157,6 +177,16 @@ class RegexFilter:
                         seen.add(entry)
                         matched_patterns.append(entry)
                     risk_score = max(risk_score, severity)
+                    # One hit per pattern is enough; the remaining forms are
+                    # rewrites of the same text.
+                    break
+
+        for marker in detect_obfuscation(prompt):
+            entry = f"obfuscation: {marker}"
+            if entry not in seen:
+                seen.add(entry)
+                matched_patterns.append(entry)
+            risk_score = max(risk_score, self.OBFUSCATION_SEVERITY.get(marker, 0.0))
 
         return RegexResult(
             flag=len(matched_patterns) > 0,
