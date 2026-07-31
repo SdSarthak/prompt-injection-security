@@ -233,9 +233,40 @@ class LLMGuard:
                 "changes": summary,
                 "sanitized_prompt": sanitized,
             }
-            result["metadata"]["action"] = "sanitized"
-            result["safe_prompt"] = self.sanitizer.wrap_safely(sanitized)
-            logger.info("Prompt SANITIZED: %s", summary)
+
+            # SANITIZE is a promise that the payload was neutralised. The
+            # sanitizer substitutes literal text, so an obfuscated
+            # meta-instruction ("I g n o r e  a l l ...") survives it untouched
+            # and would be forwarded to the model wrapped in a safety frame
+            # that does nothing. Verify the promise instead of assuming it:
+            # refuse when a definitive signature survives sanitization, and
+            # when the signature was only ever visible after de-obfuscation -
+            # in that case the sanitizer's patterns cannot have matched it.
+            residual = self.regex_filter.check(sanitized)
+            hidden_signature = (
+                regex_result.score >= 1.0
+                and self.regex_filter.check(user_prompt, deobfuscate=False).score < 1.0
+            )
+            if residual.score >= 1.0 or hidden_signature:
+                result["decision"] = Decision.BLOCK.value
+                result["metadata"]["action"] = "blocked"
+                result["metadata"]["decision_reasoning"] = {
+                    "reasoning": (
+                        "Sanitization could not remove the injection signature - blocked"
+                    ),
+                    "confidence": max(
+                        decision_result.confidence, residual.score, regex_result.score
+                    ),
+                    "rule_matched": "sanitization_ineffective",
+                    "combined_score": decision_result.combined_score,
+                }
+                logger.warning(
+                    "Prompt BLOCKED (sanitization_ineffective): %s", residual.matched_patterns
+                )
+            else:
+                result["metadata"]["action"] = "sanitized"
+                result["safe_prompt"] = self.sanitizer.wrap_safely(sanitized)
+                logger.info("Prompt SANITIZED: %s", summary)
 
         else:
             result["metadata"]["action"] = "allowed"

@@ -3,7 +3,7 @@
 import re
 from typing import Dict, List
 
-from .normalize import detect_obfuscation, matching_forms
+from .normalize import detect_obfuscation, matching_forms, normalize_for_matching
 from .results import RegexResult
 
 __all__ = ["RegexFilter", "RegexResult"]
@@ -138,7 +138,7 @@ class RegexFilter:
             for key, attr, _label, _severity in self.CATEGORIES
         }
 
-    def check(self, prompt: str) -> RegexResult:
+    def check(self, prompt: str, deobfuscate: bool = True) -> RegexResult:
         """
         Check prompt against regex patterns.
 
@@ -149,6 +149,10 @@ class RegexFilter:
 
         Args:
             prompt: User input prompt to check
+            deobfuscate: When False, only the normalised text is matched and the
+                de-obfuscated variants are skipped. Callers use this to ask
+                "is this signature literally present?", which is what decides
+                whether a text-substitution sanitizer could have removed it.
 
         Returns:
             RegexResult with flag, matched patterns, and risk score.
@@ -162,7 +166,7 @@ class RegexFilter:
         seen = set()
         risk_score = 0.0
 
-        forms = matching_forms(prompt)
+        forms = matching_forms(prompt) if deobfuscate else [normalize_for_matching(prompt)]
 
         for key, _attr, label, severity in self.CATEGORIES:
             for pattern in self.patterns[key]:
