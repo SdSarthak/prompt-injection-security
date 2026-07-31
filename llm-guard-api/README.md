@@ -281,15 +281,17 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest
 ```
 
-123 tests covering every layer, the orchestrator, and all API routes. The whole
-suite runs offline in about seven seconds - no API key, no network, no GPU.
+214 tests covering every layer, the orchestrator, and all API routes. The whole
+suite runs offline in about thirty seconds - no API key, no network, no GPU.
 
 ```
+tests/test_normalize.py            every unicode/spacing/leet evasion, and its false positives
 tests/test_regex_rules.py          pattern coverage, false positives, dedup, ReDoS bound
 tests/test_decision_engine.py      the full decision matrix and threshold overrides
 tests/test_sanitizer.py            each level, separators, truncation, edge cases
-tests/test_baseline_classifier.py  accuracy, batching, thresholds, train/reload round trip
-tests/test_guard.py                end-to-end verdicts, evaluation metrics, truncation
+tests/test_baseline_classifier.py  accuracy, batching, artifact provenance, atomic writes
+tests/test_config.py               environment parsing and cross-setting invariants
+tests/test_guard.py                end-to-end verdicts, batching, evaluation, truncation
 tests/test_api.py                  every route, auth, validation, response contract
 ```
 
@@ -301,18 +303,44 @@ trained on. Reproduce with `python evaluate.py`:
 
 | Metric | Value |
 |---|---|
-| Overall accuracy | **0.9760** |
-| Attack recall (blocked or sanitized) | **0.9754** |
+| Overall accuracy | **0.9791** |
+| Attack recall (blocked or sanitized) | **0.9857** |
 | Benign specificity (allowed untouched) | **0.9763** |
-| Precision | 0.9463 |
-| F1 | 0.9606 |
-| False negatives (attacks allowed through) | 12 / 488 |
+| Precision | 0.9469 |
+| F1 | 0.9659 |
+| False negatives (attacks allowed through) | 7 / 488 |
 | False positives (benign prompts held up) | 27 / 1137 |
-| Mean latency | **2.4 ms/prompt** (CPU, single process) |
+| Mean latency | **2.3 ms/prompt** (CPU, single process, batched) |
 
 These are pipeline numbers, not classifier numbers: regex false positives and
 decision-engine thresholds are included. The classifier alone scores 0.9932
 accuracy and 0.9998 ROC-AUC on the same split.
+
+`evaluate.py` does not take the split on trust. The trained artifact records a
+digest of every prompt it was fitted on, so any evaluation row the model has
+already seen — because `--data`, `--seed` or `--test-size` disagreed with
+training — is excluded and reported rather than quietly inflating the score.
+
+### Obfuscation
+
+The patterns are matched against normalised views of the prompt, not the raw
+bytes. Each of these is the same attack and all of them score 1.0 on the regex
+layer; before normalisation every one of them scored 0.0:
+
+```
+Ignore all previous instructions          plain
+Ig<U+200B>nore all previous instructions  zero-width space
+Ｉｇｎｏｒｅ all previous instructions        fullwidth
+Ignоre all previоus instructiоns          Cyrillic homoglyphs
+I g n o r e  a l l  p r e v i o u s       letter spacing
+1gn0re a11 prev10us 1nstruct10ns          leetspeak
+Ig-nore all pre-vious inst-ructions       intra-word separators
+```
+
+Normalisation is used only for detection; the prompt forwarded to the model is
+never the folded copy. Invisible characters are the one exception — the
+sanitizer strips them, because they carry no meaning and exist only to break
+pattern matching.
 
 ```bash
 python evaluate.py                      # full held-out set
