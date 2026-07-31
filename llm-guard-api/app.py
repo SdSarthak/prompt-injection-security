@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
 from guard import (
@@ -98,6 +98,15 @@ class LLMGuard:
 
     # ------------------------------------------------------------------ layers
 
+    @staticmethod
+    def _prepare(user_prompt: Any) -> Tuple[str, bool]:
+        """Coerce and cap the input. Returns ``(text, was_truncated)``."""
+        text = "" if user_prompt is None else str(user_prompt)
+        if 0 < config.MAX_PROMPT_LENGTH < len(text):
+            # Cap before any regex work: unbounded input is itself a DoS vector.
+            return text[: config.MAX_PROMPT_LENGTH], True
+        return text, False
+
     def analyze(self, user_prompt: str) -> Dict[str, Any]:
         """
         Run the local defense layers and return a verdict. No network calls.
@@ -110,14 +119,8 @@ class LLMGuard:
             LLM (``safe_prompt``, None when blocked) and full layer metadata.
         """
         started = time.perf_counter()
-        user_prompt = "" if user_prompt is None else str(user_prompt)
+        user_prompt, truncated = self._prepare(user_prompt)
         timestamp = datetime.now(timezone.utc).isoformat()
-
-        truncated = False
-        if config.MAX_PROMPT_LENGTH > 0 and len(user_prompt) > config.MAX_PROMPT_LENGTH:
-            # Cap before any regex work: unbounded input is itself a DoS vector.
-            user_prompt = user_prompt[: config.MAX_PROMPT_LENGTH]
-            truncated = True
 
         # Step 1: Regex filter (fast first gate)
         regex_result = self.regex_filter.check(user_prompt)
@@ -127,6 +130,58 @@ class LLMGuard:
         intent_result = self.classifier.classify(user_prompt)
         logger.debug("Intent=%s confidence=%s", intent_result.intent, intent_result.confidence)
 
+        return self._build_result(
+            user_prompt, truncated, regex_result, intent_result, timestamp, started
+        )
+
+    def analyze_batch(self, prompts: Sequence[str]) -> List[Dict[str, Any]]:
+        """
+        Analyze many prompts, classifying them in one vectorised pass.
+
+        Same verdicts as calling :meth:`analyze` in a loop, but the classifier
+        sees the whole batch at once instead of one row at a time, which is
+        where nearly all of the per-prompt cost sits.
+
+        Args:
+            prompts: Raw user inputs.
+
+        Returns:
+            One result dict per input, in the same order.
+        """
+        started = time.perf_counter()
+        prepared = [self._prepare(p) for p in prompts]
+        if not prepared:
+            return []
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        texts = [text for text, _ in prepared]
+        regex_results = [self.regex_filter.check(text) for text in texts]
+        intent_results = self.classifier.batch_classify(texts)
+
+        results = [
+            self._build_result(text, truncated, regex_result, intent_result, timestamp)
+            for (text, truncated), regex_result, intent_result in zip(
+                prepared, regex_results, intent_results
+            )
+        ]
+
+        # There is no per-prompt timing in a vectorised pass, so report the
+        # amortised cost rather than a number that is wrong for every row.
+        per_prompt = round((time.perf_counter() - started) * 1000 / len(results), 3)
+        for result in results:
+            result["metadata"]["latency_ms"] = per_prompt
+        return results
+
+    def _build_result(
+        self,
+        user_prompt: str,
+        truncated: bool,
+        regex_result,
+        intent_result,
+        timestamp: str,
+        started: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Apply the decision rules and assemble the response payload."""
         # Step 3: Decision
         decision_result = self.decision_engine.decide(
             regex_flag=regex_result.flag,
@@ -186,7 +241,9 @@ class LLMGuard:
             result["safe_prompt"] = user_prompt
             logger.info("Prompt ALLOWED")
 
-        result["metadata"]["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        result["metadata"]["latency_ms"] = (
+            0.0 if started is None else round((time.perf_counter() - started) * 1000, 3)
+        )
         return result
 
     def guard(self, user_prompt: str, call_llm: bool = True, **llm_kwargs) -> Dict[str, Any]:
@@ -246,7 +303,7 @@ class LLMGuard:
         if not test_prompts:
             raise ValueError("test_prompts must not be empty")
 
-        predictions = [self.analyze(prompt)["decision"] for prompt in test_prompts]
+        predictions = [result["decision"] for result in self.analyze_batch(test_prompts)]
         labels = [Decision.ALLOW.value, Decision.SANITIZE.value, Decision.BLOCK.value]
 
         correct = sum(1 for pred, truth in zip(predictions, true_labels) if pred == truth)

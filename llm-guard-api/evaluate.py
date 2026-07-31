@@ -13,9 +13,10 @@ Runs entirely offline: it uses ``LLMGuard.analyze``, so it never calls Gemini.
 import argparse
 import json
 import logging
+import os
 import time
 from collections import Counter
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -34,11 +35,27 @@ def load_holdout(
     """Load the same held-out split the persisted baseline model was scored on.
 
     Using the identical split and seed as training keeps the evaluation honest:
-    none of these rows were fit on.
+    none of these rows were fit on. :func:`drop_leaked` verifies that claim
+    against the model's recorded training set rather than assuming it.
     """
     from sklearn.model_selection import train_test_split
 
-    frame = pd.read_csv(data_path).dropna(subset=["prompt", "label"])
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(
+            f"No dataset at {data_path}. Pass --data, or run "
+            "`python train.py --download-only` to fetch the bundled corpus."
+        )
+    if not 0.0 < test_size < 1.0:
+        raise ValueError(f"--test-size must be strictly between 0 and 1 (got {test_size})")
+
+    frame = pd.read_csv(data_path)
+    missing = {"prompt", "label"} - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"{data_path} is missing required column(s): {sorted(missing)}; "
+            f"found {sorted(frame.columns)}"
+        )
+    frame = frame.dropna(subset=["prompt", "label"])
     frame = frame[frame["prompt"].astype(str).str.strip() != ""]
     if frame.empty:
         raise ValueError(f"No usable rows in {data_path}")
@@ -56,10 +73,46 @@ def load_holdout(
     return x_test, y_test
 
 
+def drop_leaked(
+    guard, prompts: Sequence[str], labels: Sequence[str]
+) -> Tuple[List[str], List[str], Optional[int]]:
+    """Remove prompts the classifier was trained on.
+
+    ``--data``, ``--test-size`` or ``--seed`` that do not match the ones the
+    model was fitted with silently put training rows into the "held-out" set,
+    and the resulting numbers look excellent for the wrong reason. The trained
+    artifact records a digest of every training prompt, so the overlap can be
+    measured instead of assumed.
+
+    Returns ``(prompts, labels, n_removed)``; ``n_removed`` is None when the
+    model carries no provenance and the question cannot be answered.
+    """
+    classifier = getattr(guard, "classifier", None)
+    was_trained_on = getattr(classifier, "was_trained_on", None)
+    if was_trained_on is None or was_trained_on("probe") is None:
+        return list(prompts), list(labels), None
+
+    kept = [(p, y) for p, y in zip(prompts, labels) if not was_trained_on(p)]
+    removed = len(prompts) - len(kept)
+    if removed:
+        logger.warning("Excluded %d evaluation prompt(s) the model was trained on", removed)
+    if not kept:
+        raise ValueError(
+            "Every evaluation prompt was in the model's training set. Retrain with "
+            "`python train.py --backend baseline` or evaluate on a different corpus."
+        )
+    return [p for p, _ in kept], [y for _, y in kept], removed
+
+
 def evaluate(guard, prompts: Sequence[str], labels: Sequence[str]) -> dict:
     """Score end-to-end decisions against benign/malicious ground truth."""
+    if len(prompts) != len(labels):
+        raise ValueError("prompts and labels must be the same length")
+    if not prompts:
+        raise ValueError("nothing to evaluate")
+
     started = time.perf_counter()
-    decisions = [guard.analyze(prompt)["decision"] for prompt in prompts]
+    decisions = [result["decision"] for result in guard.analyze_batch(prompts)]
     elapsed = time.perf_counter() - started
 
     true_positive = sum(
@@ -102,6 +155,11 @@ def print_report(metrics: dict, backend: str) -> None:
     print("=" * 64)
     print(f"backend              {backend}")
     print(f"held-out prompts     {metrics['n']} ({metrics['attacks']} attacks, {metrics['benign']} benign)")
+    leaked = metrics.get("excluded_seen_in_training")
+    if leaked is None:
+        print("training overlap     unknown (model carries no provenance)")
+    elif leaked:
+        print(f"training overlap     {leaked} prompt(s) excluded - the model was fit on them")
     print()
     print(f"overall accuracy     {metrics['accuracy']:.4f}")
     print(f"attack recall        {metrics['attack_recall']:.4f}  (blocked or sanitized)")
@@ -125,19 +183,36 @@ def main() -> int:
     parser.add_argument("--test-size", type=float, default=config.TEST_SPLIT)
     parser.add_argument("--seed", type=int, default=42, help="Must match the training seed")
     parser.add_argument("--limit", type=int, default=0, help="Evaluate at most N prompts")
+    parser.add_argument(
+        "--keep-seen",
+        action="store_true",
+        help="Score prompts the model was trained on instead of excluding them",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a report")
     args = parser.parse_args()
+
+    if args.limit < 0:
+        parser.error("--limit must not be negative")
 
     # Every blocked prompt logs a warning; over a whole corpus that is noise.
     logging.basicConfig(level=logging.ERROR)
     logging.disable(logging.WARNING)
 
-    prompts, labels = load_holdout(args.data, args.test_size, args.seed, args.limit)
+    try:
+        prompts, labels = load_holdout(args.data, args.test_size, args.seed, args.limit)
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
 
     from app import LLMGuard
 
     guard = LLMGuard(classifier_backend=args.backend, enable_llm=False)
+
+    leaked = None
+    if not args.keep_seen:
+        prompts, labels, leaked = drop_leaked(guard, prompts, labels)
+
     metrics = evaluate(guard, prompts, labels)
+    metrics["excluded_seen_in_training"] = leaked
 
     if args.json:
         print(json.dumps(metrics, indent=2))

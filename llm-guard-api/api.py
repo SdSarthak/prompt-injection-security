@@ -6,9 +6,10 @@ or:
     python api.py
 """
 
+import hmac
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -44,7 +45,10 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
     """
     if not config.API_KEYS:
         return
-    if x_api_key not in config.API_KEYS:
+    # Compared digest-wise so the response time does not leak how many leading
+    # characters of a guessed key were correct.
+    supplied = x_api_key or ""
+    if not any(hmac.compare_digest(supplied, known) for known in config.API_KEYS):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header",
@@ -75,16 +79,25 @@ app = FastAPI(
 # --------------------------------------------------------------------- schemas
 
 
+MAX_PROMPT_CHARS = 100_000
+
+# The guard truncates to config.MAX_PROMPT_LENGTH anyway; this cap exists so a
+# multi-megabyte body is rejected before it is parsed and copied.
+PromptText = Annotated[str, Field(max_length=MAX_PROMPT_CHARS)]
+
+
 class AnalyzeRequest(BaseModel):
     """A single prompt to inspect."""
 
-    prompt: str = Field(..., description="Raw user input to inspect", max_length=100_000)
+    prompt: PromptText = Field(..., description="Raw user input to inspect")
 
 
 class BatchAnalyzeRequest(BaseModel):
     """Several prompts to inspect in one round trip."""
 
-    prompts: List[str] = Field(..., min_length=1, max_length=MAX_BATCH_SIZE)
+    # ``max_length`` on the list bounds the item count; the item type bounds
+    # each string. Without the latter a 64-item batch is unbounded in bytes.
+    prompts: List[PromptText] = Field(..., min_length=1, max_length=MAX_BATCH_SIZE)
 
 
 class GuardRequest(AnalyzeRequest):
@@ -178,7 +191,7 @@ def _to_response(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
-async def health() -> HealthResponse:
+def health() -> HealthResponse:
     """Liveness probe plus the configuration the process actually loaded."""
     guard = get_guard()
     return HealthResponse(
@@ -197,10 +210,15 @@ async def health() -> HealthResponse:
     tags=["guard"],
     dependencies=[Depends(require_api_key)],
 )
-async def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
+def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     """Classify a prompt without calling the LLM.
 
     Use this when your application owns the LLM call and only wants a verdict.
+
+    Declared ``def`` rather than ``async def`` deliberately: the guard is
+    CPU-bound (regex plus a scikit-learn forward pass), and running it directly
+    on the event loop would stall every other in-flight request, including
+    ``/health``, for the duration. FastAPI runs sync handlers in a threadpool.
     """
     return _to_response(get_guard().analyze(request.prompt))
 
@@ -211,10 +229,14 @@ async def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     tags=["guard"],
     dependencies=[Depends(require_api_key)],
 )
-async def analyze_batch(request: BatchAnalyzeRequest) -> List[Dict[str, Any]]:
-    """Classify up to 64 prompts in a single request."""
+def analyze_batch(request: BatchAnalyzeRequest) -> List[Dict[str, Any]]:
+    """Classify up to 64 prompts in a single request.
+
+    The whole batch goes through the classifier in one vectorised pass, which
+    is most of the reason to use this endpoint over 64 calls to ``/v1/analyze``.
+    """
     guard = get_guard()
-    return [_to_response(guard.analyze(prompt)) for prompt in request.prompts]
+    return [_to_response(result) for result in guard.analyze_batch(request.prompts)]
 
 
 @app.post(
@@ -223,7 +245,7 @@ async def analyze_batch(request: BatchAnalyzeRequest) -> List[Dict[str, Any]]:
     tags=["guard"],
     dependencies=[Depends(require_api_key)],
 )
-async def guard_prompt(request: GuardRequest) -> Dict[str, Any]:
+def guard_prompt(request: GuardRequest) -> Dict[str, Any]:
     """Inspect a prompt and, unless it is blocked, answer it with Gemini."""
     guard = get_guard()
 
