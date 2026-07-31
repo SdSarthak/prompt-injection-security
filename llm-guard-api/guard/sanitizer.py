@@ -6,6 +6,8 @@ from enum import Enum
 
 import config
 
+from .normalize import strip_invisible
+
 
 class SanitizationLevel(Enum):
     """Sanitization aggressiveness levels."""
@@ -90,6 +92,15 @@ class PromptSanitizer:
         original = prompt or ""
         sanitized = original
         changes = []
+
+        # Zero-width joiners, bidi overrides and soft hyphens exist in a prompt
+        # for exactly one reason: to break the patterns below while leaving the
+        # payload intact for the model. Strip them first, or "ig<ZWSP>nore all
+        # previous instructions" survives sanitization untouched.
+        stripped = strip_invisible(sanitized)
+        if stripped != sanitized:
+            sanitized = stripped
+            changes.append("Removed invisible characters")
 
         # Remove meta-instructions
         if self.level != SanitizationLevel.LOW:

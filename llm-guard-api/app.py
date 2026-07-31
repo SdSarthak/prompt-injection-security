@@ -55,6 +55,7 @@ class LLMGuard:
                 constructs a Gemini client.
         """
         logger.info("Initializing LLM Guard...")
+        config.validate()
 
         # Layer 1: Fast regex filter
         self.regex_filter = RegexFilter()
