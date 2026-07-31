@@ -200,9 +200,20 @@ regex_flag and regex_score >= 0.8 and intent == malicious   -> BLOCK
 intent == malicious and confidence >= 0.8                   -> BLOCK
 regex_score >= 1.0 and intent != benign                     -> BLOCK
 intent == suspicious and confidence >= 0.5                  -> SANITIZE
+intent == malicious and confidence >= 0.5                   -> SANITIZE
 regex_flag and regex_score >= 0.5                           -> SANITIZE
 otherwise                                                   -> ALLOW
 ```
+
+The fifth rule exists because the ordering has to be monotonic: without it a
+"malicious" verdict at 0.79 confidence fell past every gate to ALLOW while a
+weaker "suspicious" verdict at 0.5 was sanitized.
+
+A SANITIZE verdict is then verified rather than trusted. The sanitizer works by
+substituting literal text, so it cannot remove an obfuscated meta-instruction;
+if a definitive signature survives sanitization — or was only ever visible in a
+de-obfuscated view — the verdict is escalated to BLOCK
+(`rule_matched: sanitization_ineffective`).
 
 Every threshold is overridable from the environment (`REGEX_WEIGHT`,
 `INTENT_WEIGHT`, `DECISION_SUSPICIOUS_THRESHOLD`, `DECISION_MALICIOUS_THRESHOLD`).
@@ -281,7 +292,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest
 ```
 
-214 tests covering every layer, the orchestrator, and all API routes. The whole
+221 tests covering every layer, the orchestrator, and all API routes. The whole
 suite runs offline in about thirty seconds - no API key, no network, no GPU.
 
 ```
