@@ -23,8 +23,11 @@ from guard import Decision, DecisionEngine
         (True, 0.7, "benign", 0.9, Decision.SANITIZE),
         # Low-severity keyword only.
         (True, 0.3, "benign", 0.9, Decision.ALLOW),
-        # Malicious but the classifier is unsure -> do not block outright.
-        (False, 0.0, "malicious", 0.5, Decision.ALLOW),
+        # Malicious but the classifier is unsure -> neutralise, do not refuse.
+        (False, 0.0, "malicious", 0.5, Decision.SANITIZE),
+        (False, 0.0, "malicious", 0.79, Decision.SANITIZE),
+        # Below even the sanitize gate there is nothing to act on.
+        (False, 0.0, "malicious", 0.2, Decision.ALLOW),
     ],
 )
 def test_decision_matrix(decision_engine, regex_flag, regex_score, intent, intent_score, expected):
@@ -78,6 +81,27 @@ def test_scores_outside_range_are_clamped(decision_engine):
     )
     assert 0.0 <= result.combined_score <= 1.0
     assert 0.0 <= result.confidence <= 1.0
+
+
+def test_malicious_is_never_treated_more_leniently_than_suspicious(decision_engine):
+    """The severity ordering must be monotonic across intents."""
+    rank = {Decision.ALLOW: 0, Decision.SANITIZE: 1, Decision.BLOCK: 2}
+    for score in (0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+        suspicious = decision_engine.decide(False, 0.0, "suspicious", score)
+        malicious = decision_engine.decide(False, 0.0, "malicious", score)
+        assert rank[malicious.decision] >= rank[suspicious.decision], (
+            f"at score {score}: malicious -> {malicious.decision}, "
+            f"suspicious -> {suspicious.decision}"
+        )
+
+
+def test_corroborated_block_is_not_less_confident_than_either_layer(decision_engine):
+    """Two agreeing layers used to report the *weaker* of the two scores."""
+    result = decision_engine.decide(
+        regex_flag=True, regex_score=1.0, intent="malicious", intent_score=0.72
+    )
+    assert result.decision is Decision.BLOCK
+    assert result.confidence >= 0.72
 
 
 def test_safe_response_is_non_empty(decision_engine):

@@ -86,11 +86,13 @@ class DecisionEngine:
             (self.regex_weight * regex_score) + (self.intent_weight * risk_contribution), 6
         )
 
-        # High-severity cases: Block if regex + malicious intent
+        # High-severity cases: Block if regex + malicious intent.
+        # Two independent layers agreeing cannot be *less* certain than either
+        # alone, so the confidence is the stronger signal, not the weaker one.
         if regex_flag and regex_score >= 0.8 and intent == "malicious":
             return DecisionResult(
                 decision=Decision.BLOCK,
-                confidence=min(regex_score, intent_score),
+                confidence=max(regex_score, intent_score),
                 reasoning="High-risk injection pattern detected with malicious intent",
                 rule_matched="regex_high + intent_malicious",
                 combined_score=combined_score,
@@ -124,6 +126,22 @@ class DecisionEngine:
                 confidence=intent_score,
                 reasoning="Suspicious intent detected - will sanitize",
                 rule_matched="intent_suspicious",
+                combined_score=combined_score,
+            )
+
+        # A malicious classification that is not confident enough to block is
+        # still a stronger signal than a suspicious one, and a suspicious
+        # prompt at the same score gets sanitized. Without this rule the
+        # ordering inverts and the more serious verdict is handled the more
+        # leniently: "malicious" at 0.79 sailed straight through as ALLOW.
+        if intent == "malicious" and intent_score >= self.suspicious_threshold:
+            return DecisionResult(
+                decision=Decision.SANITIZE,
+                confidence=intent_score,
+                reasoning=(
+                    "Malicious intent below the block threshold - will sanitize"
+                ),
+                rule_matched="intent_malicious_low_confidence",
                 combined_score=combined_score,
             )
 
